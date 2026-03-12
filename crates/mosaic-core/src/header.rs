@@ -5,7 +5,7 @@ use zeroize::Zeroize;
 
 use crate::crypto;
 use crate::error::HeaderError;
-use crate::index::FileIndex;
+use crate::index::{FileIndex, FileIndexLegacy};
 
 /// Total header file size: 10 MB
 const HEADER_SIZE: usize = 10 * 1024 * 1024;
@@ -193,9 +193,26 @@ impl VaultHeader {
         let plaintext = crypto::decrypt_with_nonce(&key, &prelude.header_nonce, encrypted_data)
             .map_err(|_| HeaderError::DecryptionFailed)?;
 
-        // Deserialize
-        let header: VaultHeader = bincode::deserialize(&plaintext)
-            .map_err(|e| HeaderError::Serialization(e.to_string()))?;
+        // Deserialize — try current format, fall back to legacy (no directories field)
+        let header: VaultHeader = match bincode::deserialize::<VaultHeader>(&plaintext) {
+            Ok(h) => h,
+            Err(_) => {
+                // Legacy vault: FileIndex had no `directories` field
+                #[derive(Deserialize)]
+                struct VaultHeaderLegacy {
+                    metadata: VaultMetadata,
+                    pool_index: Vec<PoolEntry>,
+                    file_index: FileIndexLegacy,
+                }
+                let legacy: VaultHeaderLegacy = bincode::deserialize(&plaintext)
+                    .map_err(|e| HeaderError::Serialization(e.to_string()))?;
+                VaultHeader {
+                    metadata: legacy.metadata,
+                    pool_index: legacy.pool_index,
+                    file_index: FileIndex::from_legacy(legacy.file_index),
+                }
+            }
+        };
 
         Ok((header, key))
     }

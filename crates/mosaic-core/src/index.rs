@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use zeroize::Zeroize;
 
 /// Index of virtual files within the vault.
@@ -7,11 +7,20 @@ use zeroize::Zeroize;
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct FileIndex {
     pub entries: BTreeMap<String, FileEntry>,
+    /// Explicitly created directories (empty dirs would otherwise vanish).
+    pub directories: BTreeSet<String>,
+}
+
+/// Legacy format without directories field — used for migration.
+#[derive(Deserialize)]
+pub(crate) struct FileIndexLegacy {
+    pub entries: BTreeMap<String, FileEntry>,
 }
 
 impl Zeroize for FileIndex {
     fn zeroize(&mut self) {
         self.entries.clear();
+        self.directories.clear();
     }
 }
 
@@ -35,6 +44,14 @@ impl FileIndex {
     pub fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
+            directories: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn from_legacy(legacy: FileIndexLegacy) -> Self {
+        Self {
+            entries: legacy.entries,
+            directories: BTreeSet::new(),
         }
     }
 
@@ -58,6 +75,18 @@ impl FileIndex {
         self.entries.remove(&normalized)
     }
 
+    pub fn add_dir(&mut self, path: &str) {
+        let normalized = normalize_path(path);
+        if !normalized.is_empty() {
+            self.directories.insert(normalized);
+        }
+    }
+
+    pub fn remove_dir(&mut self, path: &str) -> bool {
+        let normalized = normalize_path(path);
+        self.directories.remove(&normalized)
+    }
+
     /// Lists entries directly under `dir`.
     /// Returns file/directory names (not full paths).
     pub fn list_dir(&self, dir: &str) -> Vec<String> {
@@ -71,19 +100,37 @@ impl FileIndex {
             d
         };
 
-        let mut names = std::collections::BTreeSet::new();
+        let mut names = BTreeSet::new();
 
+        // Files
         for key in self.entries.keys() {
             if let Some(rest) = key.strip_prefix(&prefix) {
                 if rest.is_empty() {
                     continue;
                 }
-                // Take only the first component
                 if let Some(slash_pos) = rest.find('/') {
                     names.insert(rest[..slash_pos].to_string());
                 } else {
                     names.insert(rest.to_string());
                 }
+            }
+        }
+
+        // Explicit directories
+        for key in &self.directories {
+            if let Some(rest) = key.strip_prefix(&prefix) {
+                if rest.is_empty() {
+                    continue;
+                }
+                if let Some(slash_pos) = rest.find('/') {
+                    names.insert(rest[..slash_pos].to_string());
+                } else {
+                    names.insert(rest.to_string());
+                }
+            }
+            // Also include top-level dirs when listing root
+            if prefix.is_empty() && !key.contains('/') {
+                names.insert(key.clone());
             }
         }
 
@@ -95,13 +142,19 @@ impl FileIndex {
         self.entries.contains_key(&normalized)
     }
 
-    /// Checks if a path acts as a directory (has entries beneath it).
+    /// Checks if a path acts as a directory (has entries beneath it or is explicitly created).
     pub fn is_dir(&self, dir: &str) -> bool {
         if dir.is_empty() || dir == "/" {
             return true;
         }
+        let normalized = normalize_path(dir);
+        // Check explicit directories
+        if self.directories.contains(&normalized) {
+            return true;
+        }
+        // Check implicit directories (have files beneath them)
         let prefix = {
-            let mut d = normalize_path(dir);
+            let mut d = normalized;
             if !d.ends_with('/') {
                 d.push('/');
             }

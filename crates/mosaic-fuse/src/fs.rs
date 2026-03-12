@@ -102,6 +102,7 @@ fn ino_to_path(header: &VaultHeader, ino: u64) -> Option<String> {
 
 fn collect_dirs(header: &VaultHeader) -> Vec<String> {
     let mut dirs = BTreeSet::new();
+    // Implicit directories from file paths
     for key in header.file_index.entries.keys() {
         let parts: Vec<&str> = key.split('/').collect();
         let mut path = String::new();
@@ -115,6 +116,10 @@ fn collect_dirs(header: &VaultHeader) -> Vec<String> {
             path.push_str(part);
             dirs.insert(path.clone());
         }
+    }
+    // Explicit directories
+    for dir in &header.file_index.directories {
+        dirs.insert(dir.clone());
     }
     dirs.into_iter().collect()
 }
@@ -489,7 +494,7 @@ impl Filesystem for MosaicFS {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let header = self.header.read().unwrap();
+        let mut header = self.header.write().unwrap();
         let parent_path = match ino_to_path(&header, parent) {
             Some(p) => p,
             None => {
@@ -507,11 +512,12 @@ impl Filesystem for MosaicFS {
         let full_path = MosaicFS::path_from_ino_and_name(&parent_path, name_str);
         let ino = path_to_ino(&full_path);
 
+        header.file_index.add_dir(&full_path);
         reply.entry(&TTL, &dir_attr(ino), 0);
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        let header = self.header.read().unwrap();
+        let mut header = self.header.write().unwrap();
         let parent_path = match ino_to_path(&header, parent) {
             Some(p) => p,
             None => {
@@ -534,6 +540,7 @@ impl Filesystem for MosaicFS {
             return;
         }
 
+        header.file_index.remove_dir(&full_path);
         reply.ok();
     }
 
@@ -728,6 +735,9 @@ impl Filesystem for MosaicFS {
 
         if let Some(entry) = header.file_index.remove(&old_path) {
             header.file_index.insert(&new_path, entry);
+            reply.ok();
+        } else if header.file_index.remove_dir(&old_path) {
+            header.file_index.add_dir(&new_path);
             reply.ok();
         } else {
             reply.error(libc::ENOENT);

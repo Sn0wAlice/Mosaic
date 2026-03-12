@@ -87,7 +87,6 @@ pub const TILE_SIZES: &[(u64, &str)] = &[
 /// Dashboard field focus.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DashboardField {
-    FileList,
     UnmountButton,
     RefreshButton,
 }
@@ -95,9 +94,8 @@ pub enum DashboardField {
 impl DashboardField {
     pub fn next(&self) -> Self {
         match self {
-            Self::FileList => Self::UnmountButton,
             Self::UnmountButton => Self::RefreshButton,
-            Self::RefreshButton => Self::FileList,
+            Self::RefreshButton => Self::UnmountButton,
         }
     }
 }
@@ -129,7 +127,6 @@ pub struct App {
     pub header: Option<VaultHeader>,
     pub prelude: Option<VaultPrelude>,
     pub key: Option<[u8; 32]>,
-    pub file_list_scroll: usize,
     pub dashboard_error: Option<String>,
 
     // FUSE mount handle (kept alive while mounted)
@@ -198,12 +195,11 @@ impl App {
             init_error: None,
             init_creating: false,
 
-            dashboard_field: DashboardField::FileList,
+            dashboard_field: DashboardField::UnmountButton,
             mount_point: None,
             header: None,
             prelude: None,
             key: None,
-            file_list_scroll: 0,
             dashboard_error: None,
 
             mount_handle: None,
@@ -229,7 +225,7 @@ impl App {
 
     pub fn goto_dashboard(&mut self) {
         self.screen = Screen::Dashboard;
-        self.dashboard_field = DashboardField::FileList;
+        self.dashboard_field = DashboardField::UnmountButton;
         self.dashboard_error = None;
     }
 }

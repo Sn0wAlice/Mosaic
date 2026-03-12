@@ -404,14 +404,6 @@ async fn handle_dashboard_key(app: &mut App, code: KeyCode) -> Result<()> {
         KeyCode::Tab => {
             app.dashboard_field = app.dashboard_field.next();
         }
-        KeyCode::Up if app.dashboard_field == DashboardField::FileList => {
-            if app.file_list_scroll > 0 {
-                app.file_list_scroll -= 1;
-            }
-        }
-        KeyCode::Down if app.dashboard_field == DashboardField::FileList => {
-            app.file_list_scroll += 1;
-        }
         KeyCode::Enter => match app.dashboard_field {
             DashboardField::UnmountButton => {
                 do_unmount(app).await;
@@ -420,7 +412,6 @@ async fn handle_dashboard_key(app: &mut App, code: KeyCode) -> Result<()> {
             DashboardField::RefreshButton => {
                 refresh_dashboard(app);
             }
-            _ => {}
         },
         _ => {}
     }
