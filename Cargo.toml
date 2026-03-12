@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/mosaic-core",
+    "crates/mosaic-fuse",
+    "crates/mosaic-tui",
+]
+resolver = "2"
+
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }

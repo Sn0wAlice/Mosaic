@@ -1,0 +1,20 @@
+[package]
+name = "mosaic-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1.7", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
