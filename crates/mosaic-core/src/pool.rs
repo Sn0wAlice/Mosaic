@@ -207,8 +207,61 @@ impl PoolManager {
     /// Creates a new empty pool file on disk.
     fn create_pool(&self, pool_id: u32) -> Result<(), PoolError> {
         let path = self.pool_path(pool_id);
-        std::fs::File::create(&path)?;
+        let file = std::fs::File::create(&path)?;
+        file.sync_all()?;
         Ok(())
+    }
+
+    /// Verifies that all pool files exist on disk and are accessible.
+    /// Returns a list of issues found (empty = all OK).
+    pub fn verify_integrity(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        for entry in &self.pool_index {
+            let path = self.pool_path(entry.id);
+            if !path.exists() {
+                issues.push(format!(
+                    "Pool {} ({}) missing from disk",
+                    entry.id, entry.filename
+                ));
+                continue;
+            }
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    issues.push(format!(
+                        "Pool {} ({}) unreadable: {}",
+                        entry.id, entry.filename, e
+                    ));
+                    continue;
+                }
+            };
+            // Pool file size should be consistent: each 64KB logical block
+            // maps to ENCRYPTED_BLOCK_SIZE on disk. File should not be truncated.
+            if entry.size_bytes > 0 {
+                let expected_blocks = (entry.size_bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                let min_size = expected_blocks * ENCRYPTED_BLOCK_SIZE;
+                if meta.len() < min_size {
+                    issues.push(format!(
+                        "Pool {} ({}) truncated: expected >= {} bytes, got {}",
+                        entry.id,
+                        entry.filename,
+                        min_size,
+                        meta.len()
+                    ));
+                }
+            }
+        }
+        issues
+    }
+
+    /// Recalculates the total used space across all pools (logical bytes).
+    pub fn total_used(&self) -> u64 {
+        self.pool_index.iter().map(|p| p.size_bytes).sum()
+    }
+
+    /// Returns total capacity across all pools.
+    pub fn total_capacity(&self) -> u64 {
+        self.pool_index.len() as u64 * self.tile_size
     }
 
     /// Computes the path of a pool from its id.

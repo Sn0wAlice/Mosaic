@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::io::Write as IoWrite;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
@@ -144,8 +145,28 @@ pub enum PoolStatus {
 
 impl VaultHeader {
     /// Reads and decrypts a vault.header from disk.
+    /// Falls back to vault.header.bak if the main header is corrupted.
     /// Returns (header, derived_key).
     pub fn open(path: &Path, password: &[u8]) -> Result<(Self, [u8; 32]), HeaderError> {
+        match Self::open_from(path, password) {
+            Ok(result) => Ok(result),
+            Err(primary_err) => {
+                // Try backup
+                let bak_path = path.with_extension("header.bak");
+                if bak_path.exists() {
+                    tracing::warn!(
+                        "Primary header failed ({}), trying backup...",
+                        primary_err
+                    );
+                    Self::open_from(&bak_path, password).map_err(|_| primary_err)
+                } else {
+                    Err(primary_err)
+                }
+            }
+        }
+    }
+
+    fn open_from(path: &Path, password: &[u8]) -> Result<(Self, [u8; 32]), HeaderError> {
         let data = std::fs::read(path)?;
         if data.len() < PRELUDE_SIZE + HMAC_SIZE {
             return Err(HeaderError::InvalidMagic);
@@ -256,7 +277,25 @@ impl VaultHeader {
         let hmac = crypto::compute_hmac(key, &buf[..HEADER_SIZE - HMAC_SIZE]);
         buf[HEADER_SIZE - HMAC_SIZE..].copy_from_slice(&hmac);
 
-        std::fs::write(path, &buf)?;
+        // Write to a temporary file first, then rename for atomicity.
+        // Also keep a .bak shadow copy for recovery.
+        let tmp_path = path.with_extension("header.tmp");
+        let bak_path = path.with_extension("header.bak");
+
+        // Write new data to temp file
+        {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(&buf)?;
+            file.sync_all()?;
+        }
+
+        // Back up current header (if it exists) before overwriting
+        if path.exists() {
+            let _ = std::fs::copy(path, &bak_path);
+        }
+
+        // Atomic rename (on POSIX this is atomic within the same filesystem)
+        std::fs::rename(&tmp_path, path)?;
         Ok(())
     }
 

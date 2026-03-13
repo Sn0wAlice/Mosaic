@@ -32,27 +32,37 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
+    // Determine how many error history lines to show (max 3)
+    let error_lines = std::cmp::min(app.error_history.len(), 3) as u16;
+    let error_section_height = if error_lines > 0 { error_lines } else { 1 };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(2), // mount info
+            Constraint::Length(3), // mount info + space info
             Constraint::Length(1), // separator
             Constraint::Length(1), // TILES header
             Constraint::Min(3),   // tile bars (takes all remaining space)
             Constraint::Length(1), // separator
             Constraint::Length(1), // buttons
-            Constraint::Length(1), // error
+            Constraint::Length(error_section_height), // error history
         ])
         .split(inner);
 
-    // Mount info
+    // Mount info + space info
     let mount_info = if let Some(ref mp) = app.mount_point {
         format!("  Mount point: {}", mp)
     } else {
         "  Mount point: (not mounted)".to_string()
     };
     let vault_info = format!("  Vault:       {}", app.vault_path);
+    let space_info = format!(
+        "  Space:       {} used / {} total ({} free)",
+        format_size(app.used_space_bytes),
+        format_size(app.total_space_bytes),
+        format_size(app.free_space_bytes),
+    );
 
     buf.set_string(
         chunks[0].x,
@@ -65,6 +75,12 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         chunks[0].y + 1,
         &vault_info,
         Style::default().fg(Color::DarkGray),
+    );
+    buf.set_string(
+        chunks[0].x,
+        chunks[0].y + 2,
+        &space_info,
+        Style::default().fg(Color::Green),
     );
 
     // Separator
@@ -137,14 +153,50 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         );
     }
 
-    // Error
-    if let Some(ref err) = app.dashboard_error {
+    // Error history (show latest errors, most recent at bottom)
+    let err_area = chunks[6];
+    if !app.error_history.is_empty() {
+        let start = if app.error_history.len() > 3 {
+            app.error_history.len() - 3
+        } else {
+            0
+        };
+        for (i, err) in app.error_history.iter().skip(start).enumerate() {
+            if i as u16 >= err_area.height {
+                break;
+            }
+            let max_len = (err_area.width as usize).saturating_sub(4);
+            let truncated = if err.len() > max_len {
+                format!("✗ {}…", &err[..max_len.saturating_sub(1)])
+            } else {
+                format!("✗ {}", err)
+            };
+            buf.set_string(
+                err_area.x + 2,
+                err_area.y + i as u16,
+                &truncated,
+                Style::default().fg(Color::Red),
+            );
+        }
+    } else if let Some(ref err) = app.dashboard_error {
         buf.set_string(
-            chunks[6].x + 2,
-            chunks[6].y,
+            err_area.x + 2,
+            err_area.y,
             &format!("✗ {}", err),
             Style::default().fg(Color::Red),
         );
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
     }
 }
 

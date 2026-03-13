@@ -4,6 +4,8 @@ mod widgets;
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -18,6 +20,7 @@ use tracing::{error, info};
 
 use app::{App, DashboardField, InitField, Screen, UnlockField, TILE_SIZES};
 use mosaic_core::header::{self, VaultHeader};
+use mosaic_core::lock::VaultLock;
 use mosaic_core::pool::PoolManager;
 
 #[derive(Parser)]
@@ -110,6 +113,11 @@ async fn cmd_init(header_path: &Path) -> Result<()> {
 async fn cmd_mount(header_path: &Path, mountpoint: &Path) -> Result<()> {
     mosaic_fuse::check_fuse().context("FUSE check failed")?;
 
+    // Acquire lock
+    let _lock = VaultLock::acquire(header_path)
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .context("Failed to lock vault")?;
+
     let password = rpassword::prompt_password("Password: ")?;
 
     let (header, key) = VaultHeader::open(header_path, password.as_bytes())
@@ -127,6 +135,15 @@ async fn cmd_mount(header_path: &Path, mountpoint: &Path) -> Result<()> {
         key,
         header.pool_index.clone(),
     );
+
+    // Verify pool integrity
+    let issues = pools.verify_integrity();
+    if !issues.is_empty() {
+        for issue in &issues {
+            eprintln!("Warning: {}", issue);
+        }
+        eprintln!("Pool integrity issues found. Proceeding anyway...");
+    }
 
     // Create mountpoint if needed
     if !mountpoint.exists() {
@@ -150,6 +167,7 @@ async fn cmd_mount(header_path: &Path, mountpoint: &Path) -> Result<()> {
     tokio::signal::ctrl_c().await?;
     println!("\nUnmounting...");
     drop(session);
+    // _lock is dropped here, releasing the lock file
     println!("Vault sealed.");
     Ok(())
 }
@@ -196,8 +214,6 @@ fn cmd_status(header_path: &Path) -> Result<()> {
 
 fn cmd_seal(header_path: &Path) -> Result<()> {
     println!("Seal operation: vault at {} will be locked.", header_path.display());
-    // In practice, we would find and unmount any active FUSE mount.
-    // For now, this is a stub.
     println!("If a FUSE mount is active, terminate the mount process to seal.");
     Ok(())
 }
@@ -228,7 +244,23 @@ async fn run_tui() -> Result<()> {
 
     let mut app = App::new();
 
-    let result = run_tui_loop(&mut terminal, &mut app).await;
+    // Set up signal handler for clean shutdown
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    {
+        let flag = shutdown_flag.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+
+    let result = run_tui_loop(&mut terminal, &mut app, &shutdown_flag).await;
+
+    // Clean shutdown: unmount if still mounted
+    if app.mount_handle.is_some() {
+        do_unmount(&mut app).await;
+    }
 
     // Restore terminal
     disable_raw_mode()?;
@@ -241,8 +273,17 @@ async fn run_tui() -> Result<()> {
 async fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
+    shutdown_flag: &Arc<AtomicBool>,
 ) -> Result<()> {
     loop {
+        // Check for signal-based shutdown
+        if shutdown_flag.load(Ordering::SeqCst) {
+            if app.mount_handle.is_some() {
+                do_unmount(app).await;
+            }
+            app.quit();
+        }
+
         terminal.draw(|frame| {
             let area = frame.size();
             match app.screen {
@@ -282,6 +323,9 @@ async fn run_tui_loop(
 async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     // Global quit
     if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+        if app.mount_handle.is_some() {
+            do_unmount(app).await;
+        }
         app.quit();
         return Ok(());
     }
@@ -427,6 +471,15 @@ async fn do_mount(app: &mut App) {
         return;
     }
 
+    // Acquire lock before opening
+    let lock = match VaultLock::acquire(&header_path) {
+        Ok(l) => l,
+        Err(e) => {
+            app.unlock_error = Some(format!("{}", e));
+            return;
+        }
+    };
+
     let password = app.unlock_password.as_bytes().to_vec();
     match VaultHeader::open(&header_path, &password) {
         Ok((header, key)) => {
@@ -449,6 +502,19 @@ async fn do_mount(app: &mut App) {
                 key,
                 header.pool_index.clone(),
             );
+
+            // Verify pool integrity
+            let issues = pools.verify_integrity();
+            for issue in &issues {
+                app.push_error(format!("Pool: {}", issue));
+            }
+
+            // Compute space info
+            let total = pools.total_capacity();
+            let used = pools.total_used();
+            app.total_space_bytes = total;
+            app.used_space_bytes = used;
+            app.free_space_bytes = total.saturating_sub(used);
 
             // Create a temporary mountpoint with random suffix
             let rand_suffix: String = (0..10)
@@ -480,6 +546,7 @@ async fn do_mount(app: &mut App) {
                     app.prelude = Some(prelude);
                     app.key = Some(key);
                     app.mount_handle = Some(handle);
+                    app.vault_lock = Some(lock);
                     app.unlock_password.clear();
                     app.goto_dashboard();
                     info!("Vault mounted at {}", mount_point.display());
@@ -555,7 +622,7 @@ async fn do_unmount(app: &mut App) {
         let header_path = PathBuf::from(&app.vault_path);
         if let Err(e) = header.save(&header_path, key, prelude) {
             error!("Failed to save header: {}", e);
-            app.dashboard_error = Some(format!("Failed to save: {}", e));
+            app.push_error(format!("Failed to save: {}", e));
         }
     }
 
@@ -568,16 +635,22 @@ async fn do_unmount(app: &mut App) {
     }
     app.key = None;
     app.mount_point = None;
+
+    // Release the vault lock
+    app.vault_lock.take();
+
     info!("Vault unmounted and sealed");
 }
 
 fn refresh_dashboard(app: &mut App) {
-    // Re-read header to update pool/file state
-    if let Some(_key) = app.key {
-        let header_path = PathBuf::from(&app.vault_path);
-        if let Ok((_header, _)) = VaultHeader::open(&header_path, &[]) {
-            // We can't re-open without password; the dashboard just shows cached state.
-            // A more complete implementation would keep the decrypted header in memory.
-        }
+    // Update space info from cached header
+    if let Some(ref header) = app.header {
+        let tile_size = header.metadata.tile_size_bytes;
+        let pool_count = header.pool_index.len() as u64;
+        let total = pool_count * tile_size;
+        let used: u64 = header.pool_index.iter().map(|p| p.size_bytes).sum();
+        app.total_space_bytes = total;
+        app.used_space_bytes = used;
+        app.free_space_bytes = total.saturating_sub(used);
     }
 }

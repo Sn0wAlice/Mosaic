@@ -1,5 +1,10 @@
+use std::collections::VecDeque;
 use mosaic_core::header::{VaultHeader, VaultPrelude};
+use mosaic_core::lock::VaultLock;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+/// Maximum number of errors kept in the error history ring buffer.
+const MAX_ERROR_HISTORY: usize = 10;
 
 /// TUI application screens.
 #[derive(Debug, Clone, PartialEq)]
@@ -128,9 +133,18 @@ pub struct App {
     pub prelude: Option<VaultPrelude>,
     pub key: Option<[u8; 32]>,
     pub dashboard_error: Option<String>,
+    pub error_history: VecDeque<String>,
+
+    /// Free space info (cached, updated on refresh)
+    pub free_space_bytes: u64,
+    pub total_space_bytes: u64,
+    pub used_space_bytes: u64,
 
     // FUSE mount handle (kept alive while mounted)
     pub mount_handle: Option<fuser::BackgroundSession>,
+
+    // Vault lock (kept alive while mounted, released on unmount)
+    pub vault_lock: Option<VaultLock>,
 }
 
 /// A password buffer that zeroizes on drop.
@@ -201,9 +215,24 @@ impl App {
             prelude: None,
             key: None,
             dashboard_error: None,
+            error_history: VecDeque::with_capacity(MAX_ERROR_HISTORY),
+
+            free_space_bytes: 0,
+            total_space_bytes: 0,
+            used_space_bytes: 0,
 
             mount_handle: None,
+            vault_lock: None,
         }
+    }
+
+    /// Pushes an error into the ring buffer (keeps last N).
+    pub fn push_error(&mut self, msg: String) {
+        if self.error_history.len() >= MAX_ERROR_HISTORY {
+            self.error_history.pop_front();
+        }
+        self.dashboard_error = Some(msg.clone());
+        self.error_history.push_back(msg);
     }
 
     pub fn quit(&mut self) {
@@ -235,6 +264,7 @@ impl Drop for App {
         if let Some(ref mut key) = self.key {
             key.zeroize();
         }
+        // vault_lock is dropped automatically, releasing the lock file
     }
 }
 
@@ -285,5 +315,17 @@ mod tests {
         assert_eq!(pw.len(), 3);
         pw.clear();
         assert!(pw.is_empty());
+    }
+
+    #[test]
+    fn test_error_history_ring_buffer() {
+        let mut app = App::new();
+        for i in 0..15 {
+            app.push_error(format!("Error {}", i));
+        }
+        assert_eq!(app.error_history.len(), MAX_ERROR_HISTORY);
+        // Oldest errors should have been evicted
+        assert_eq!(app.error_history.front().unwrap(), "Error 5");
+        assert_eq!(app.error_history.back().unwrap(), "Error 14");
     }
 }
