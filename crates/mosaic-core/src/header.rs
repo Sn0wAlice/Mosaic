@@ -211,7 +211,7 @@ impl VaultHeader {
         }
 
         // Decrypt
-        let plaintext = crypto::decrypt_with_nonce(&key, &prelude.header_nonce, encrypted_data)
+        let mut plaintext = crypto::decrypt_with_nonce(&key, &prelude.header_nonce, encrypted_data)
             .map_err(|_| HeaderError::DecryptionFailed)?;
 
         // Deserialize — try current format, fall back to legacy (no directories field)
@@ -235,25 +235,40 @@ impl VaultHeader {
             }
         };
 
+        // Zeroize decrypted plaintext buffer immediately after deserialization
+        plaintext.zeroize();
+
         Ok((header, key))
     }
 
     /// Encrypts and writes the header to disk (10 MB padded).
+    /// A fresh random nonce is generated on every save to prevent nonce reuse.
     pub fn save(
         &self,
         path: &Path,
         key: &[u8; 32],
         prelude: &VaultPrelude,
     ) -> Result<(), HeaderError> {
-        let serialized =
+        let mut serialized =
             bincode::serialize(self).map_err(|e| HeaderError::Serialization(e.to_string()))?;
 
-        // Encrypt
-        let encrypted = crypto::encrypt_with_nonce(key, &prelude.header_nonce, &serialized)
+        // Generate a FRESH nonce for every save — nonce reuse with ChaCha20-Poly1305
+        // would leak the XOR of plaintexts and break authentication.
+        let mut fresh_nonce = [0u8; 12];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut fresh_nonce);
+
+        // Encrypt with the fresh nonce
+        let encrypted = crypto::encrypt_with_nonce(key, &fresh_nonce, &serialized)
             .map_err(|_| HeaderError::DecryptionFailed)?;
 
-        // Build the full 10 MB buffer
-        let prelude_bytes = prelude.to_bytes()?;
+        // Zeroize plaintext immediately after encryption
+        serialized.zeroize();
+
+        // Build updated prelude with the fresh nonce
+        let mut updated_prelude = prelude.clone();
+        updated_prelude.header_nonce = fresh_nonce;
+        let prelude_bytes = updated_prelude.to_bytes()?;
+
         let mut buf = vec![0u8; HEADER_SIZE];
         buf[..PRELUDE_SIZE].copy_from_slice(&prelude_bytes);
 

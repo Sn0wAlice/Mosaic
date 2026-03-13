@@ -1,10 +1,11 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 use crate::crypto;
 use crate::error::PoolError;
 use crate::header::{PoolEntry, PoolStatus};
+use crate::security;
 
 /// Block size for encryption within pools: 64 KB
 const BLOCK_SIZE: u64 = 64 * 1024;
@@ -13,15 +14,22 @@ const TAG_OVERHEAD: u64 = 16;
 /// Encrypted block size on disk: 64 KB plaintext + 16 bytes tag
 const ENCRYPTED_BLOCK_SIZE: u64 = BLOCK_SIZE + TAG_OVERHEAD;
 
-#[derive(Zeroize, ZeroizeOnDrop)]
+/// Manages pool files (encrypted tiles) for the vault.
+/// The encryption key is locked in physical memory (mlock) and zeroized on drop.
 pub struct PoolManager {
-    #[zeroize(skip)]
     header_dir: PathBuf,
-    #[zeroize(skip)]
     tile_size: u64,
     key: [u8; 32],
-    #[zeroize(skip)]
     pool_index: Vec<PoolEntry>,
+}
+
+impl Drop for PoolManager {
+    fn drop(&mut self) {
+        // Unlock the key from physical memory before zeroizing
+        security::munlock_key(&self.key);
+        // Zeroize the key
+        self.key.zeroize();
+    }
 }
 
 impl PoolManager {
@@ -31,12 +39,15 @@ impl PoolManager {
         key: [u8; 32],
         pool_index: Vec<PoolEntry>,
     ) -> Self {
-        Self {
+        let mgr = Self {
             header_dir,
             tile_size,
             key,
             pool_index,
-        }
+        };
+        // Lock the key into physical memory so it won't be swapped to disk
+        security::mlock_key(&mgr.key);
+        mgr
     }
 
     /// Returns a snapshot of the current pool index for saving to header.
@@ -201,7 +212,49 @@ impl PoolManager {
         }
 
         file.sync_all()?;
+
+        // Update the pool checksum after writing
+        self.update_pool_checksum(pool_id)?;
+
         Ok(())
+    }
+
+    /// Recomputes the HMAC-SHA256 checksum of an entire pool file.
+    /// This detects if pool files were tampered with outside of Mosaic.
+    fn update_pool_checksum(&mut self, pool_id: u32) -> Result<(), PoolError> {
+        let path = self.pool_path(pool_id);
+        let data = std::fs::read(&path)?;
+        let checksum = crypto::compute_hmac(&self.key, &data);
+
+        if let Some(entry) = self.pool_index.iter_mut().find(|e| e.id == pool_id) {
+            entry.checksum = checksum;
+        }
+        Ok(())
+    }
+
+    /// Verifies the HMAC checksum of a pool file against the stored checksum.
+    /// Returns true if the pool file has not been tampered with.
+    /// Pools with an all-zero checksum (legacy/uninitialized) are skipped.
+    pub fn verify_pool_checksum(&self, pool_id: u32) -> Result<bool, PoolError> {
+        let entry = self
+            .pool_index
+            .iter()
+            .find(|e| e.id == pool_id)
+            .ok_or(PoolError::PoolNotFound(pool_id))?;
+
+        // Skip verification for legacy pools with uninitialized checksums
+        if entry.checksum == [0u8; 32] {
+            return Ok(true);
+        }
+
+        let path = self.pool_path(pool_id);
+        if !path.exists() {
+            return Err(PoolError::PoolNotFound(pool_id));
+        }
+
+        let data = std::fs::read(&path)?;
+        let computed = crypto::compute_hmac(&self.key, &data);
+        Ok(computed == entry.checksum)
     }
 
     /// Creates a new empty pool file on disk.
@@ -248,6 +301,25 @@ impl PoolManager {
                         min_size,
                         meta.len()
                     ));
+                }
+            }
+
+            // Verify anti-tamper HMAC checksum (skip legacy pools with zero checksums)
+            if entry.checksum != [0u8; 32] {
+                match self.verify_pool_checksum(entry.id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        issues.push(format!(
+                            "Pool {} ({}) TAMPERED: HMAC checksum mismatch!",
+                            entry.id, entry.filename
+                        ));
+                    }
+                    Err(e) => {
+                        issues.push(format!(
+                            "Pool {} ({}) checksum verification failed: {}",
+                            entry.id, entry.filename, e
+                        ));
+                    }
                 }
             }
         }

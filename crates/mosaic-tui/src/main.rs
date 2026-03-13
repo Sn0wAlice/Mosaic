@@ -22,6 +22,7 @@ use app::{App, DashboardField, InitField, Screen, UnlockField, TILE_SIZES};
 use mosaic_core::header::{self, VaultHeader};
 use mosaic_core::lock::VaultLock;
 use mosaic_core::pool::PoolManager;
+use mosaic_core::security;
 
 #[derive(Parser)]
 #[command(name = "mosaic", version = "0.1.0", about = "Encrypted tile-based virtual partition manager")]
@@ -58,6 +59,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Apply OS-level security hardening BEFORE any key material is created:
+    // - Disable core dumps (RLIMIT_CORE = 0)
+    // - Disable ptrace attachment (Linux only)
+    security::harden_process();
+
     let cli = Cli::parse();
 
     let is_tui = cli.command.is_none();
@@ -122,6 +128,9 @@ async fn cmd_mount(header_path: &Path, mountpoint: &Path) -> Result<()> {
 
     let (header, key) = VaultHeader::open(header_path, password.as_bytes())
         .context("Failed to open vault")?;
+
+    // Lock the derived key in physical memory to prevent swap
+    security::mlock_key(&key);
 
     let prelude = header::read_prelude(header_path)?;
     let header_dir = header_path
@@ -483,6 +492,8 @@ async fn do_mount(app: &mut App) {
     let password = app.unlock_password.as_bytes().to_vec();
     match VaultHeader::open(&header_path, &password) {
         Ok((header, key)) => {
+            // Lock the derived key in physical memory to prevent swap
+            security::mlock_key(&key);
             let prelude = match header::read_prelude(&header_path) {
                 Ok(p) => p,
                 Err(e) => {
@@ -631,6 +642,8 @@ async fn do_unmount(app: &mut App) {
     app.header = None;
     app.prelude = None;
     if let Some(ref mut key) = app.key {
+        // Unlock from physical memory pinning, then zeroize
+        security::munlock_key(key);
         zeroize::Zeroize::zeroize(key);
     }
     app.key = None;
